@@ -6,17 +6,15 @@ import core.nbt.file.NBTFile;
 import core.nbt.tag.CompoundTag;
 import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
 import net.kyori.adventure.key.Key;
+import net.minecraft.server.level.ServerChunkCache;
 import net.thenextlvl.worlds.WorldsPlugin;
-import net.thenextlvl.worlds.api.event.WorldActionScheduledEvent;
+import net.thenextlvl.worlds.api.event.*;
 import net.thenextlvl.worlds.api.event.WorldActionScheduledEvent.ActionType;
-import net.thenextlvl.worlds.api.event.WorldBackupEvent;
-import net.thenextlvl.worlds.api.event.WorldCloneEvent;
-import net.thenextlvl.worlds.api.event.WorldDeleteEvent;
-import net.thenextlvl.worlds.api.event.WorldRegenerateEvent;
 import net.thenextlvl.worlds.api.generator.Generator;
 import net.thenextlvl.worlds.api.level.Level;
 import net.thenextlvl.worlds.api.view.LevelView;
 import net.thenextlvl.worlds.level.LevelData;
+import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.craftbukkit.CraftWorld;
@@ -33,10 +31,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Optional;
-import java.util.Set;
+import java.util.*;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -147,12 +143,33 @@ public class PaperLevelView implements LevelView {
      * @see CraftWorld#save(boolean)
      */
     @Override
-    public void save(World world, boolean flush) {
+    public CompletableFuture<Void> save(World world, boolean flush) {
         var level = ((CraftWorld) world).getHandle();
         var oldSave = level.noSave;
         level.noSave = false;
-        level.save(null, flush, false);
+        if (WorldsPlugin.RUNNING_FOLIA) {
+            List<CompletableFuture<Void>> futures = new ArrayList<>();
+            level.regioniser.computeForAllRegions((region) -> {
+                CompletableFuture<Void> future = new CompletableFuture<>();
+                futures.add(future);
+                var location = region.getCenterChunk();
+                Bukkit.getRegionScheduler().run(plugin, world, location.x, location.z, (task) -> {
+                    try {
+                        ServerChunkCache chunkCache = level.getChunkSource();
+                        chunkCache.save(flush);
+                        future.complete(null);
+                    } catch (Throwable e) {
+                        future.completeExceptionally(e);
+                    }
+                });
+            });
+            CompletableFuture<Void> allFutures = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));
+            return allFutures;
+        } else {
+            level.save(null, flush, false);
+        }
         level.noSave = oldSave;
+        return CompletableFuture.completedFuture(null);
     }
 
     /**

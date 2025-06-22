@@ -12,6 +12,7 @@ import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.Consumer;
 
 /**
@@ -111,8 +112,9 @@ public interface LevelView {
      *
      * @param world the world to be saved
      * @param flush whether to flush pending changes to disk immediately
+     * @return
      */
-    void save(World world, boolean flush);
+    CompletableFuture<Void> save(World world, boolean flush);
 
     /**
      * Saves the {@code level.dat} of the specified world to disk.

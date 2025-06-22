@@ -35,8 +35,9 @@ class WorldSaveCommand {
         var world = context.getArgument("world", World.class);
         var placeholder = Placeholder.parsed("world", world.getName());
         plugin.bundle().sendMessage(context.getSource().getSender(), "world.save", placeholder);
-        plugin.levelView().save(world, flush);
-        plugin.bundle().sendMessage(context.getSource().getSender(), "world.save.success", placeholder);
+        plugin.levelView().save(world, flush).thenAccept((ignore) -> {
+            plugin.bundle().sendMessage(context.getSource().getSender(), "world.save.success", placeholder);
+        });
         return Command.SINGLE_SUCCESS;
     }
 }
