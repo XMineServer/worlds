@@ -5,8 +5,10 @@ import core.io.IO;
 import core.nbt.file.NBTFile;
 import core.nbt.tag.CompoundTag;
 import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
+import io.papermc.paper.threadedregions.RegionizedServer;
 import net.kyori.adventure.key.Key;
 import net.minecraft.server.level.ServerChunkCache;
+import net.minecraft.server.level.ServerLevel;
 import net.thenextlvl.worlds.WorldsPlugin;
 import net.thenextlvl.worlds.api.event.*;
 import net.thenextlvl.worlds.api.event.WorldActionScheduledEvent.ActionType;
@@ -17,7 +19,9 @@ import net.thenextlvl.worlds.level.LevelData;
 import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
+import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
+import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.generator.WorldInfo;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.Unmodifiable;
@@ -26,6 +30,7 @@ import org.jspecify.annotations.Nullable;
 
 import java.io.File;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -33,6 +38,7 @@ import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
 import java.util.*;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.function.BiPredicate;
 import java.util.function.Consumer;
 import java.util.regex.Pattern;
@@ -133,13 +139,76 @@ public class PaperLevelView implements LevelView {
 
     @Override
     public boolean unload(World world, boolean save) {
-        if (!plugin.getServer().unloadWorld(world, save)) return false;
+        if (WorldsPlugin.RUNNING_FOLIA) {
+            var server = ((CraftServer) plugin.getServer());
+            var console = server.getServer();
+            var level = ((CraftWorld) world).getHandle();
+            Field serverWorldsField;
+            Field regionizedServerWorldsField;
+            try {
+                serverWorldsField = CraftServer.class.getDeclaredField("worlds");
+                serverWorldsField.setAccessible(true);
+            } catch (NoSuchFieldException e) {
+                plugin.getSLF4JLogger().error("Can't access CraftServer.worlds field", e);
+                return false;
+            }
+            try {
+                regionizedServerWorldsField = RegionizedServer.class.getDeclaredField("worlds");
+                regionizedServerWorldsField.setAccessible(true);
+            } catch (NoSuchFieldException e) {
+                plugin.getSLF4JLogger().error("Can't access RegionizedServer.worlds field", e);
+                return false;
+            }
+
+            if (console.getLevel(level.dimension()) == null) {
+                return false;
+            }
+
+            if (!level.players().isEmpty()) {
+                return false;
+            }
+
+            try {
+                if (save) {
+                    save(world, true);
+                }
+
+                level.getChunkSource().close(save);
+
+                console.removeLevel(level);
+            } catch (Exception ex) {
+                plugin.getLogger().log(java.util.logging.Level.SEVERE, null, ex);
+            }
+
+            try {
+                @SuppressWarnings("unchecked")
+                var worlds = (Map<String, World>) serverWorldsField.get(server);
+                worlds.remove(world.getName().toLowerCase(Locale.ROOT));
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().error("Fail to remove world {} from CraftServer worlds", world.getName(), e);
+            }
+
+            console.removeLevel(level);
+            var regionizedServer = RegionizedServer.getInstance();
+            try {
+                @SuppressWarnings("unchecked")
+                var worlds = (CopyOnWriteArrayList<ServerLevel>) regionizedServerWorldsField.get(regionizedServer);
+                worlds.remove(level);
+            } catch (Exception e) {
+                plugin.getSLF4JLogger().error("Fail to remove world {} from RegionizedServer worlds", world.getName(), e);
+            }
+            return true;
+
+        } else {
+            if (!plugin.getServer().unloadWorld(world, save)) return false;
+        }
         var dragonBattle = world.getEnderDragonBattle();
         if (dragonBattle != null) dragonBattle.getBossBar().removeAll();
         return true;
     }
 
     /**
+     * @return
      * @see CraftWorld#save(boolean)
      */
     @Override
@@ -147,27 +216,7 @@ public class PaperLevelView implements LevelView {
         var level = ((CraftWorld) world).getHandle();
         var oldSave = level.noSave;
         level.noSave = false;
-        if (WorldsPlugin.RUNNING_FOLIA) {
-            List<CompletableFuture<Void>> futures = new ArrayList<>();
-            level.regioniser.computeForAllRegions((region) -> {
-                CompletableFuture<Void> future = new CompletableFuture<>();
-                futures.add(future);
-                var location = region.getCenterChunk();
-                Bukkit.getRegionScheduler().run(plugin, world, location.x, location.z, (task) -> {
-                    try {
-                        ServerChunkCache chunkCache = level.getChunkSource();
-                        chunkCache.save(flush);
-                        future.complete(null);
-                    } catch (Throwable e) {
-                        future.completeExceptionally(e);
-                    }
-                });
-            });
-            CompletableFuture<Void> allFutures = CompletableFuture.allOf(futures.toArray(CompletableFuture[]::new));
-            return allFutures;
-        } else {
-            level.save(null, flush, false);
-        }
+        level.save(null, flush, false);
         level.noSave = oldSave;
         return CompletableFuture.completedFuture(null);
     }
@@ -318,13 +367,19 @@ public class PaperLevelView implements LevelView {
     }
 
     private DeletionResult deleteNow(World world) {
-        if (WorldsPlugin.RUNNING_FOLIA || world.getKey().asString().equals("minecraft:overworld"))
+        if (world.getKey().asString().equals("minecraft:overworld"))
             return DeletionResult.REQUIRES_SCHEDULING;
 
         if (!new WorldDeleteEvent(world).callEvent()) return DeletionResult.FAILED;
 
         var fallback = plugin.getServer().getWorlds().getFirst().getSpawnLocation();
-        world.getPlayers().forEach(player -> player.teleport(fallback));
+        if (WorldsPlugin.RUNNING_FOLIA) {
+            //TODO: Run in correct Thread and await for complete.
+            // You need to move all the players before calling the method.
+            world.getPlayers().forEach(player -> player.teleportAsync(fallback));
+        } else {
+            world.getPlayers().forEach(player -> player.teleport(fallback));
+        }
 
         if (!plugin.levelView().unload(world, false))
             return DeletionResult.UNLOAD_FAILED;
