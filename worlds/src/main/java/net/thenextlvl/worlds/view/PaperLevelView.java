@@ -7,7 +7,6 @@ import core.nbt.tag.CompoundTag;
 import io.papermc.paper.plugin.provider.classloader.ConfiguredPluginClassLoader;
 import io.papermc.paper.threadedregions.RegionizedServer;
 import net.kyori.adventure.key.Key;
-import net.minecraft.server.level.ServerChunkCache;
 import net.minecraft.server.level.ServerLevel;
 import net.thenextlvl.worlds.WorldsPlugin;
 import net.thenextlvl.worlds.api.event.*;
@@ -16,12 +15,10 @@ import net.thenextlvl.worlds.api.generator.Generator;
 import net.thenextlvl.worlds.api.level.Level;
 import net.thenextlvl.worlds.api.view.LevelView;
 import net.thenextlvl.worlds.level.LevelData;
-import org.bukkit.Bukkit;
 import org.bukkit.NamespacedKey;
 import org.bukkit.World;
 import org.bukkit.craftbukkit.CraftServer;
 import org.bukkit.craftbukkit.CraftWorld;
-import org.bukkit.event.world.WorldLoadEvent;
 import org.bukkit.generator.WorldInfo;
 import org.bukkit.plugin.java.JavaPlugin;
 import org.jetbrains.annotations.Unmodifiable;
@@ -197,6 +194,23 @@ public class PaperLevelView implements LevelView {
             } catch (Exception e) {
                 plugin.getSLF4JLogger().error("Fail to remove world {} from RegionizedServer worlds", world.getName(), e);
             }
+            CompletableFuture
+                    .runAsync(() ->
+                            // ThreadedRegionizer::computeForAllRegions run in that thread, without scheduling
+                        level.regioniser.computeForAllRegions(regionThread -> {
+                            plugin.getSLF4JLogger().info("Found thread {} for world {}", regionThread.id, regionThread.getData().world.getWorld().getName());
+                            if (regionThread.getData().world == level) {
+                                // That mark will terminate thread on next tick
+                                regionThread.getData().getRegionSchedulingHandle().markNonSchedulable();
+                                plugin.getSLF4JLogger().info("Region schedule marker as nonSchedulable thread {} for world {}", regionThread.id, regionThread.getData().world.getWorld().getName());
+                            }
+                        })
+                    )
+                    .thenAccept((result) -> plugin.getSLF4JLogger().info("Terminate all threads for {}", level.getWorld().getName()))
+                    .exceptionally((e) -> {
+                        plugin.getSLF4JLogger().error("Terminate threads fail for {}", level.getWorld().getName());
+                        return null;
+                    });
             return true;
 
         } else {
